@@ -29,15 +29,16 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import Any, cast
+from typing import Any, Literal, TypeGuard, cast
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from typing_extensions import Literal, TypedDict, TypeGuard
+from typing_extensions import TypedDict
 
 from ...items import TResponseInputItem
 from ...memory.session import SessionABC
+from ...memory.session_settings import SessionSettings, resolve_session_limit
 
 
 class EncryptedEnvelope(TypedDict):
@@ -135,6 +136,16 @@ class EncryptedSession(SessionABC):
     def __getattr__(self, name):
         return getattr(self.underlying_session, name)
 
+    @property
+    def session_settings(self) -> SessionSettings | None:
+        """Get session settings from the underlying session."""
+        return self.underlying_session.session_settings
+
+    @session_settings.setter
+    def session_settings(self, value: SessionSettings | None) -> None:
+        """Set session settings on the underlying session."""
+        self.underlying_session.session_settings = value
+
     def _wrap(self, item: TResponseInputItem) -> EncryptedEnvelope:
         if isinstance(item, dict):
             payload = item
@@ -159,14 +170,31 @@ class EncryptedSession(SessionABC):
         except (InvalidToken, KeyError):
             return None
 
-    async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
-        encrypted_items = await self.underlying_session.get_items(limit)
+    def _unwrap_valid_items(
+        self, encrypted_items: list[TResponseInputItem]
+    ) -> list[TResponseInputItem]:
         valid_items: list[TResponseInputItem] = []
         for enc in encrypted_items:
             item = self._unwrap(enc)
             if item is not None:
                 valid_items.append(item)
         return valid_items
+
+    async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
+        effective_limit = resolve_session_limit(limit, self.session_settings)
+        if effective_limit is not None and effective_limit > 0:
+            window = effective_limit
+            while True:
+                encrypted_items = await self.underlying_session.get_items(window)
+                valid_items = self._unwrap_valid_items(encrypted_items)
+                if len(valid_items) >= effective_limit:
+                    return valid_items[-effective_limit:]
+                if len(encrypted_items) < window:
+                    return valid_items
+                window *= 2
+
+        encrypted_items = await self.underlying_session.get_items(limit)
+        return self._unwrap_valid_items(encrypted_items)
 
     async def add_items(self, items: list[TResponseInputItem]) -> None:
         wrapped: list[EncryptedEnvelope] = [self._wrap(it) for it in items]

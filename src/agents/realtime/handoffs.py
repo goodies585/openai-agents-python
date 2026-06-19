@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import inspect
-from typing import TYPE_CHECKING, Any, Callable, cast, overload
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, cast, overload
 
 from pydantic import TypeAdapter
 from typing_extensions import TypeVar
@@ -13,10 +14,10 @@ from ..strict_schema import ensure_strict_json_schema
 from ..tracing.spans import SpanError
 from ..util import _error_tracing, _json
 from ..util._types import MaybeAwaitable
+from . import RealtimeAgent
 
 if TYPE_CHECKING:
     from ..agent import AgentBase
-    from . import RealtimeAgent
 
 
 # The handoff input type is the type of data passed when the agent is called via a handoff.
@@ -74,7 +75,7 @@ def realtime_handoff(
     """Create a handoff from a RealtimeAgent.
 
     Args:
-        agent: The RealtimeAgent to handoff to, or a function that returns a RealtimeAgent.
+        agent: The RealtimeAgent to handoff to.
         tool_name_override: Optional override for the name of the tool that represents the handoff.
         tool_description_override: Optional override for the description of the tool that
             represents the handoff.
@@ -87,12 +88,12 @@ def realtime_handoff(
 
     Note: input_filter is not supported for RealtimeAgent handoffs.
     """
-    assert (on_handoff and input_type) or not (on_handoff and input_type), (
-        "You must provide either both on_handoff and input_type, or neither"
-    )
+    if input_type is not None and on_handoff is None:
+        raise UserError("You must provide on_handoff when input_type is provided")
     type_adapter: TypeAdapter[Any] | None
     if input_type is not None:
-        assert callable(on_handoff), "on_handoff must be callable"
+        if not callable(on_handoff):
+            raise UserError("on_handoff must be callable")
         sig = inspect.signature(on_handoff)
         if len(sig.parameters) != 2:
             raise UserError("on_handoff must take two arguments: context and input")

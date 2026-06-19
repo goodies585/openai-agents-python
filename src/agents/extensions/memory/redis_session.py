@@ -25,22 +25,29 @@ import asyncio
 import json
 import time
 from typing import Any
-from urllib.parse import urlparse
+
+from ._optional_imports import raise_optional_dependency_error
 
 try:
     import redis.asyncio as redis
     from redis.asyncio import Redis
 except ImportError as e:
-    raise ImportError(
-        "RedisSession requires the 'redis' package. Install it with: pip install redis"
-    ) from e
+    raise_optional_dependency_error(
+        "RedisSession",
+        dependency_name="redis",
+        extra_name="redis",
+        cause=e,
+    )
 
 from ...items import TResponseInputItem
 from ...memory.session import SessionABC
+from ...memory.session_settings import SessionSettings, resolve_session_limit
 
 
 class RedisSession(SessionABC):
-    """Redis implementation of :pyclass:`agents.memory.session.Session`."""
+    """Redis implementation of [`Session`][agents.memory.session.Session]."""
+
+    session_settings: SessionSettings | None = None
 
     def __init__(
         self,
@@ -49,6 +56,7 @@ class RedisSession(SessionABC):
         redis_client: Redis,
         key_prefix: str = "agents:session",
         ttl: int | None = None,
+        session_settings: SessionSettings | None = None,
     ):
         """Initializes a new RedisSession.
 
@@ -59,8 +67,11 @@ class RedisSession(SessionABC):
                 Defaults to "agents:session".
             ttl (int | None, optional): Time-to-live in seconds for session data.
                 If None, data persists indefinitely. Defaults to None.
+            session_settings (SessionSettings | None): Session configuration settings including
+                default limit for retrieving items. If None, uses default SessionSettings().
         """
         self.session_id = session_id
+        self.session_settings = session_settings or SessionSettings()
         self._redis = redis_client
         self._key_prefix = key_prefix
         self._ttl = ttl
@@ -79,6 +90,7 @@ class RedisSession(SessionABC):
         *,
         url: str,
         redis_kwargs: dict[str, Any] | None = None,
+        session_settings: SessionSettings | None = None,
         **kwargs: Any,
     ) -> RedisSession:
         """Create a session from a Redis URL string.
@@ -88,6 +100,8 @@ class RedisSession(SessionABC):
             url (str): Redis URL, e.g. "redis://localhost:6379/0" or "rediss://host:6380".
             redis_kwargs (dict[str, Any] | None): Additional keyword arguments forwarded to
                 redis.asyncio.from_url.
+            session_settings (SessionSettings | None): Session configuration settings including
+                default limit for retrieving items. If None, uses default SessionSettings().
             **kwargs: Additional keyword arguments forwarded to the main constructor
                 (e.g., key_prefix, ttl, etc.).
 
@@ -96,13 +110,13 @@ class RedisSession(SessionABC):
         """
         redis_kwargs = redis_kwargs or {}
 
-        # Parse URL to determine if we need SSL
-        parsed = urlparse(url)
-        if parsed.scheme == "rediss":
-            redis_kwargs.setdefault("ssl", True)
-
         redis_client = redis.from_url(url, **redis_kwargs)
-        session = cls(session_id, redis_client=redis_client, **kwargs)
+        session = cls(
+            session_id,
+            redis_client=redis_client,
+            session_settings=session_settings,
+            **kwargs,
+        )
         session._owns_client = True  # We created the client, so we own it
         return session
 
@@ -135,22 +149,24 @@ class RedisSession(SessionABC):
         """Retrieve the conversation history for this session.
 
         Args:
-            limit: Maximum number of items to retrieve. If None, retrieves all items.
+            limit: Maximum number of items to retrieve. If None, uses session_settings.limit.
                    When specified, returns the latest N items in chronological order.
 
         Returns:
             List of input items representing the conversation history
         """
+        session_limit = resolve_session_limit(limit, self.session_settings)
+
         async with self._lock:
-            if limit is None:
+            if session_limit is None:
                 # Get all messages in chronological order
                 raw_messages = await self._redis.lrange(self._messages_key, 0, -1)  # type: ignore[misc]  # Redis library returns Union[Awaitable[T], T] in async context
             else:
-                if limit <= 0:
+                if session_limit <= 0:
                     return []
                 # Get the latest N messages (Redis list is ordered chronologically)
                 # Use negative indices to get from the end - Redis uses -N to -1 for last N items
-                raw_messages = await self._redis.lrange(self._messages_key, -limit, -1)  # type: ignore[misc]  # Redis library returns Union[Awaitable[T], T] in async context
+                raw_messages = await self._redis.lrange(self._messages_key, -session_limit, -1)  # type: ignore[misc]  # Redis library returns Union[Awaitable[T], T] in async context
 
             items: list[TResponseInputItem] = []
             for raw_msg in raw_messages:
@@ -179,16 +195,11 @@ class RedisSession(SessionABC):
 
         async with self._lock:
             pipe = self._redis.pipeline()
+            now = str(int(time.time()))
 
-            # Set session metadata with current timestamp
-            pipe.hset(
-                self._session_key,
-                mapping={
-                    "session_id": self.session_id,
-                    "created_at": str(int(time.time())),
-                    "updated_at": str(int(time.time())),
-                },
-            )
+            # Set session metadata, preserving created_at across subsequent writes.
+            pipe.hset(self._session_key, "session_id", self.session_id)
+            pipe.hsetnx(self._session_key, "created_at", now)
 
             # Add all items to the messages list
             serialized_items = []
@@ -200,7 +211,7 @@ class RedisSession(SessionABC):
                 pipe.rpush(self._messages_key, *serialized_items)
 
             # Update the session timestamp
-            pipe.hset(self._session_key, "updated_at", str(int(time.time())))
+            pipe.hset(self._session_key, "updated_at", now)
 
             # Execute all commands
             await pipe.execute()
@@ -217,22 +228,23 @@ class RedisSession(SessionABC):
             The most recent item if it exists, None if the session is empty
         """
         async with self._lock:
-            # Use RPOP to atomically remove and return the rightmost (most recent) item
-            raw_msg = await self._redis.rpop(self._messages_key)  # type: ignore[misc]  # Redis library returns Union[Awaitable[T], T] in async context
+            while True:
+                # Use RPOP to atomically remove and return the rightmost (most recent) item
+                raw_msg = await self._redis.rpop(self._messages_key)  # type: ignore[misc]  # Redis library returns Union[Awaitable[T], T] in async context
 
-            if raw_msg is None:
-                return None
+                if raw_msg is None:
+                    return None
 
-            try:
-                # Handle both bytes (default) and str (decode_responses=True) Redis clients
-                if isinstance(raw_msg, bytes):
-                    msg_str = raw_msg.decode("utf-8")
-                else:
-                    msg_str = raw_msg  # Already a string
-                return await self._deserialize_item(msg_str)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                # Return None for corrupted messages (already removed)
-                return None
+                try:
+                    # Handle both bytes (default) and str (decode_responses=True) Redis clients
+                    if isinstance(raw_msg, bytes):
+                        msg_str = raw_msg.decode("utf-8")
+                    else:
+                        msg_str = raw_msg  # Already a string
+                    return await self._deserialize_item(msg_str)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # Drop corrupted messages and keep looking for a valid item.
+                    continue
 
     async def clear_session(self) -> None:
         """Clear all items for this session."""
@@ -261,7 +273,7 @@ class RedisSession(SessionABC):
             True if Redis is reachable, False otherwise.
         """
         try:
-            await self._redis.ping()
+            await self._redis.ping()  # type: ignore[misc]  # Redis library returns Union[Awaitable[T], T] in async context
             return True
         except Exception:
             return False
